@@ -1,6 +1,5 @@
 package main
 
-
 import (
 	"bytes"
 	"encoding/json"
@@ -16,7 +15,6 @@ var (
 	internalKey    = os.Getenv("NEXTENDO_INTERNAL_KEY")
 	gateClient     = &http.Client{Timeout: 3 * time.Second}
 )
-
 
 func nextendoOnlineCheck(pid uint64, kind string) (bool, string) {
 	body, _ := json.Marshal(map[string]any{"pid": pid, "kind": kind})
@@ -43,20 +41,18 @@ func nextendoOnlineCheck(pid uint64, kind string) (bool, string) {
 	return out.Allow, out.Reason
 }
 
-
 type nsaStatus int
 
 const (
-	nsaOK          nsaStatus = iota 
-	nsaUnknown                     
-	nsaUnreachable                  
+	nsaOK nsaStatus = iota
+	nsaUnknown
+	nsaUnreachable
 )
 
 var (
 	nsaCacheMu sync.Mutex
 	nsaCache   = map[uint64]uint64{}
 )
-
 
 func resolveNSAtoPID(nsa uint64) (uint64, nsaStatus) {
 	nsaCacheMu.Lock()

@@ -1,5 +1,4 @@
-﻿package main
-
+package main
 
 import (
 	"crypto/subtle"
@@ -26,7 +25,7 @@ var (
 	rmcTotal int64
 
 	eventsMu    sync.Mutex
-	events      []rmcEvent 
+	events      []rmcEvent
 	methodCount = map[string]int64{}
 )
 
@@ -46,7 +45,6 @@ type rmcEvent struct {
 	Proto  uint16
 	Method uint32
 }
-
 
 func noteRMC(c *nex.Connection, req *nex.RMCMessage) {
 	pid := c.PID
@@ -79,7 +77,6 @@ func noteRMC(c *nex.Connection, req *nex.RMCMessage) {
 	methodCount[rmcName(req.Protocol, req.Method)]++
 	eventsMu.Unlock()
 }
-
 
 func gameModeName(mode uint32) string {
 	switch mode {
@@ -136,8 +133,6 @@ func rmcName(proto uint16, method uint32) string {
 	}
 	return pn + "::" + mn
 }
-
-
 
 type apiPlayer struct {
 	PID        uint64 `json:"pid"`
@@ -219,7 +214,6 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 	conns := endpoint.SnapshotConnections()
 	gaths := mm.Snapshot()
 
-	
 	type metaSnap struct {
 		calls       int64
 		first, last time.Time
@@ -234,7 +228,6 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 	}
 	metaMu.Unlock()
 
-	
 	pidGathering := map[uint64]uint32{}
 	pidMode := map[uint64]uint32{}
 	pidVR := map[uint64]uint32{}
@@ -271,7 +264,6 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 	}
 	sort.Slice(gs, func(i, j int) bool { return gs[i].ID < gs[j].ID })
 
-	
 	players := make([]apiPlayer, 0, len(conns))
 	inLobby := 0
 	seen := map[uint64]bool{}
@@ -314,7 +306,6 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 		peakConnected = len(players)
 	}
 
-	
 	eventsMu.Lock()
 	ev := make([]apiEvent, 0, len(events))
 	for i := len(events) - 1; i >= 0; i-- {
@@ -350,12 +341,10 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 	}
 }
 
-
 func startDashboard(endpoint *nex.Endpoint, mm *nex.Matchmaking) {
 	port := envOr("DASH_PORT", "8082")
 	token := envOr("DASH_TOKEN", "")
 
-	
 	authed := func(w http.ResponseWriter, r *http.Request) bool {
 		if token != "" && subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("key")), []byte(token)) == 1 {
 			return true
@@ -391,7 +380,6 @@ func startDashboard(endpoint *nex.Endpoint, mm *nex.Matchmaking) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"reaped": endpoint.ReapIdle(nex.ReapIdleTimeout())})
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
-
 
 	registerAccountEndpoints(mux)
 

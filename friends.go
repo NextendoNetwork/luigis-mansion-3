@@ -1,11 +1,11 @@
-﻿package main
-
+package main
 
 import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -16,15 +16,10 @@ import (
 	nex "github.com/NextendoNetwork/nextendo-nex"
 )
 
-
-
-
 var friendsFilePath = os.Getenv("LM3_FRIENDS_FILE")
 
-
-
 type presenceEntry struct {
-	Status int 
+	Status int
 	AppID  string
 	At     time.Time
 }
@@ -33,7 +28,6 @@ var (
 	presenceMu    sync.RWMutex
 	presenceByPID = map[uint64]presenceEntry{}
 )
-
 
 const presenceTTL = 90 * time.Second
 
@@ -53,6 +47,22 @@ func getPresence(pid uint64) (presenceEntry, bool) {
 	return e, true
 }
 
+// startPresenceReaper evicts expired presence entries so the map cannot grow without
+// bound. getPresence only filters on read, so without a sweep a stream of fresh-PID
+// presence-batch POSTs would grow the map until the process is OOM-killed.
+func startPresenceReaper() {
+	for {
+		time.Sleep(presenceTTL)
+		cutoff := time.Now().Add(-presenceTTL)
+		presenceMu.Lock()
+		for pid, e := range presenceByPID {
+			if e.At.Before(cutoff) {
+				delete(presenceByPID, pid)
+			}
+		}
+		presenceMu.Unlock()
+	}
+}
 
 type fileFriendCache struct {
 	mtime  time.Time
@@ -65,7 +75,6 @@ var (
 	fileCacheMu sync.Mutex
 	fileCache   fileFriendCache
 )
-
 
 func friendFilePIDs(pid uint64) ([]uint64, bool) {
 	fileCacheMu.Lock()
@@ -105,17 +114,10 @@ func friendFilePIDs(pid uint64) ([]uint64, bool) {
 	return pids, ok
 }
 
-
-var stubFriendPIDs = map[uint64][]uint64{ // hardcoded friend pids
-	1800002682: {1800000119}, 
-	1800000119: {1800002682}, 
-}
-
 var (
 	friendsCacheMu sync.Mutex
 	friendsCache   = map[uint64]friendCacheEntry{}
 	friendsWarned  = false
-	stubNoticeOnce = false
 )
 
 const friendCacheTTL = 30 * time.Second
@@ -125,19 +127,10 @@ type friendCacheEntry struct {
 	at   time.Time
 }
 
-
 func accountFriendPIDs(pid uint64) []uint64 {
-	if os.Getenv("NEXTENDO_ACCOUNT_URL") == "" && friendsFilePath == "" {
-		if !stubNoticeOnce {
-			stubNoticeOnce = true
-			fmt.Println("[Friends] built-in test friends active (Chop<->Mars): set NEXTENDO_ACCOUNT_URL to use a real account service")
-		}
-		pids, ok := stubFriendPIDs[pid]
-		if !ok {
-			return nil
-		}
-		return pids
-	}
+	// Friends come from a real account service (NEXTENDO_ACCOUNT_URL) or the embedded
+	// file-backed endpoint (LM3_FRIENDS_FILE via loopback). With neither configured
+	// there are simply no friends — no hardcoded test identities.
 	if accountBaseURL == "" {
 		return nil
 	}
@@ -155,7 +148,6 @@ func accountFriendPIDs(pid uint64) []uint64 {
 	friendsCacheMu.Unlock()
 	return pids
 }
-
 
 func accountFriendPIDsFetch(pid uint64) []uint64 {
 	req, err := http.NewRequest("GET", accountBaseURL+"/internal/npln-friends?pid="+strconv.FormatUint(pid, 10), nil)
@@ -196,7 +188,6 @@ func accountFriendPIDsFetch(pid uint64) []uint64 {
 	return pids
 }
 
-
 func friendsWarn(format string, args ...any) {
 	friendsCacheMu.Lock()
 	first := !friendsWarned
@@ -207,9 +198,6 @@ func friendsWarn(format string, args ...any) {
 	}
 }
 
-
-
-
 func registerAccountEndpoints(mux *http.ServeMux) {
 	mux.HandleFunc("/internal/npln-friends", accountNplnFriends)
 	mux.HandleFunc("/internal/presence-batch", accountPresenceBatch)
@@ -219,17 +207,30 @@ func registerAccountEndpoints(mux *http.ServeMux) {
 	}
 }
 
-
 func accountGuard(w http.ResponseWriter, r *http.Request) bool {
-	if internalKey != "" {
-		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Internal-Key")), []byte(internalKey)) != 1 {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return false
-		}
+	// Fail CLOSED. The /internal/* endpoints exist only for this process's own embedded
+	// self-mode, which calls them over loopback. A loopback caller is allowed; any other
+	// source MUST present a matching X-Internal-Key. With no key set, only loopback is
+	// admitted — never a remote client. (The previous code allowed EVERYONE when the key
+	// was empty, exposing the friend graph and presence on the public dashboard port.)
+	if isLoopbackRequest(r) {
+		return true
 	}
-	return true
+	if internalKey != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Internal-Key")), []byte(internalKey)) == 1 {
+		return true
+	}
+	http.Error(w, "forbidden", http.StatusForbidden)
+	return false
 }
 
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
 func accountNplnFriends(w http.ResponseWriter, r *http.Request) {
 	if !accountGuard(w, r) {
@@ -260,7 +261,6 @@ func accountNplnFriends(w http.ResponseWriter, r *http.Request) {
 		"friends":  friends,
 	})
 }
-
 
 func accountPresenceBatch(w http.ResponseWriter, r *http.Request) {
 	if !accountGuard(w, r) {
@@ -294,7 +294,6 @@ func accountPresenceBatch(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "n": len(in.Pids)})
 }
 
-
 func accountOnlineCheck(w http.ResponseWriter, r *http.Request) {
 	if !accountGuard(w, r) {
 		return
@@ -315,7 +314,6 @@ func accountOnlineCheck(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"allow": true})
 }
 
-
 func publishFriendSession(mm *nex.Matchmaking, pid uint64, gid uint32) {
 	types := friendEventTypes()
 	mode := os.Getenv("LM3_FRIEND_EVENT_MODE")
@@ -331,8 +329,6 @@ func publishFriendSession(mm *nex.Matchmaking, pid uint64, gid uint32) {
 	}
 	fmt.Printf("[Friends] auto-published pid=%d gid=%d types=%v mode=%q\n", pid, gid, types, mode)
 }
-
-
 
 func friendEventTypes() []uint32 {
 	raw := os.Getenv("LM3_FRIEND_EVENT_TYPE")
@@ -351,10 +347,9 @@ func friendEventTypes() []uint32 {
 	return out
 }
 
-
 func startPresenceReporter(endpoint *nex.Endpoint) {
 	if accountBaseURL == "" || (os.Getenv("NEXTENDO_ACCOUNT_URL") == "" && friendsFilePath == "") {
-		
+
 		return
 	}
 	fmt.Printf("[Friends] presence reporter -> %s (key=%v)\n", accountBaseURL, internalKey != "")

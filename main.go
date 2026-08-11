@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,9 +24,9 @@ import (
 
 const (
 	// LM3 Key
-	accessKey = "aab95246"
-	gameServerID = 0x20DE2100
-	nexVersion = 40000
+	accessKey     = "aab95246"
+	gameServerID  = 0x20DE2100
+	nexVersion    = 40000
 	securePID     = 2
 	sessionKeyLen = 32
 	lm3AppID      = "0100dca0064a6000"
@@ -34,8 +35,8 @@ const (
 var (
 	nextendoHost   = envOr("NEXTENDO_HOST", "127.0.0.1")
 	authPort       = envOrInt("AUTH_PORT", 443)
-	securePort     = envOrInt("SECURE_PORT", 60006)
-	securePassword = envOr("NEXTENDO_SECURE_PASSWORD", "securepasswordplz1")
+	securePort     = envOrInt("SECURE_PORT", 60009)        // 60006 collides with the Minecraft server
+	securePassword = envOr("NEXTENDO_SECURE_PASSWORD", "") // no public default: main() fails fast if unset
 	certFile       = envOr("CERT_FILE", "cert.pem")
 	keyFile        = envOr("KEY_FILE", "key.pem")
 
@@ -47,20 +48,28 @@ var (
 	effectiveAccessKey = envOr("LM3_ACCESS_KEY", accessKey)
 
 	// used last before entering a lm3 lobby reports what Nat type.
-	// must be on different IPS for it to attempt stun 
-	nncsUDPPort1  = envOrInt("NNCS_UDP_PORT_1", 10025)
-	nncsUDPPort2  = envOrInt("NNCS_UDP_PORT_2", 10125)
-	nncsSinkhole1 = envOrInt("NNCS_SINKHOLE_1", 33334)
-	nncsSinkhole2 = envOrInt("NNCS_SINKHOLE_2", 33335)
-	nncsNatFile   = envOr("NNCS_NAT_FILE", defaultNATFilePath())
-	nncsTypeFile  = envOr("NNCS_TYPE_FILE", defaultNATTypeFilePath())
+	// must be on different IPS for it to attempt stun
+	nncsUDPPort1   = envOrInt("NNCS_UDP_PORT_1", 10025)
+	nncsUDPPort2   = envOrInt("NNCS_UDP_PORT_2", 10125)
+	nncsSinkhole1  = envOrInt("NNCS_SINKHOLE_1", 33334)
+	nncsSinkhole2  = envOrInt("NNCS_SINKHOLE_2", 33335)
+	nncsNatFile    = envOr("NNCS_NAT_FILE", defaultNATFilePath())
+	nncsTypeFile   = envOr("NNCS_TYPE_FILE", defaultNATTypeFilePath())
 	nncsReportedIP = envOr("NEXTENDO_HOST", "127.0.0.1")
 )
 
 var (
-	natMu   sync.Mutex
-	natMap  = map[string]string{}
-	natSeen = map[string]map[int]int{}
+	natMu       sync.Mutex
+	natMap      = map[string]string{}
+	natSeen     = map[string]map[int]int{}
+	natLastSeen = map[string]time.Time{}
+	natDirty    bool
+)
+
+const (
+	natTTL        = 5 * time.Minute
+	natMaxIPs     = 8192
+	natFlushEvery = 2 * time.Second
 )
 
 func defaultNATFilePath() string {
@@ -94,6 +103,7 @@ func recordNAT(ip string, port int) {
 	natMu.Lock()
 	defer natMu.Unlock()
 	natMap[ip] = strconv.Itoa(port)
+	natLastSeen[ip] = time.Now()
 	// A co-located host probes through loopback or its LAN interface
 	// (NEXTENDO_NAT_IP_1/2 = 127.0.0.1 / 192.168.x — its router does no hairpin),
 	// but the natbridge looks observations up by the PUBLIC station address. Same
@@ -101,12 +111,9 @@ func recordNAT(ip string, port int) {
 	// observation under NEXTENDO_HOST.
 	if src := net.ParseIP(ip); src != nil && (src.IsLoopback() || src.IsPrivate()) && reportedIPIsPublic() {
 		natMap[nncsReportedIP] = strconv.Itoa(port)
+		natLastSeen[nncsReportedIP] = time.Now()
 	}
-	var b strings.Builder
-	for k, v := range natMap {
-		b.WriteString(k + " " + v + "\n")
-	}
-	_ = os.WriteFile(nncsNatFile, []byte(b.String()), 0644)
+	natDirty = true // flushed off the packet path by natFileFlusher
 }
 
 func reportedIPIsPublic() bool {
@@ -126,7 +133,72 @@ func classifyNAT(ip string, dstPort, srcPort int) {
 		natSeen[ip] = m
 	}
 	m[dstPort] = srcPort
+	natLastSeen[ip] = time.Now()
+	natDirty = true // flushed off the packet path by natFileFlusher
+}
 
+// natFileFlusher debounces NAT-observation disk writes OFF the packet path: the UDP
+// responder only mutates in-memory maps (cheap, under lock); this goroutine prunes
+// stale/overflow entries and serializes both files at most once per natFlushEvery.
+// Writing the whole map per packet (the previous behaviour) turned a UDP flood into
+// O(N^2) disk work under a shared lock, stalling NAT/matchmaking for every player.
+func natFileFlusher() {
+	t := time.NewTicker(natFlushEvery)
+	defer t.Stop()
+	for range t.C {
+		natMu.Lock()
+		if !natDirty {
+			natMu.Unlock()
+			continue
+		}
+		pruneNATLocked()
+		natBody := renderNATMapLocked()
+		typeBody := renderNATTypesLocked()
+		natDirty = false
+		natMu.Unlock()
+		_ = os.WriteFile(nncsNatFile, []byte(natBody), 0644)
+		_ = os.WriteFile(nncsTypeFile, []byte(typeBody), 0644)
+	}
+}
+
+// pruneNATLocked drops observations older than natTTL and, if still over natMaxIPs,
+// the oldest ones — so a spoofed-source-IP UDP flood cannot grow the maps without bound.
+func pruneNATLocked() {
+	now := time.Now()
+	for ip, seen := range natLastSeen {
+		if now.Sub(seen) > natTTL {
+			delete(natMap, ip)
+			delete(natSeen, ip)
+			delete(natLastSeen, ip)
+		}
+	}
+	if len(natLastSeen) > natMaxIPs {
+		type kv struct {
+			ip string
+			t  time.Time
+		}
+		all := make([]kv, 0, len(natLastSeen))
+		for ip, seen := range natLastSeen {
+			all = append(all, kv{ip, seen})
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i].t.Before(all[j].t) })
+		for _, e := range all[:len(all)-natMaxIPs] {
+			delete(natMap, e.ip)
+			delete(natSeen, e.ip)
+			delete(natLastSeen, e.ip)
+		}
+	}
+}
+
+func renderNATMapLocked() string {
+	var b strings.Builder
+	for k, v := range natMap {
+		b.WriteString(k + " " + v + "\n")
+	}
+	return b.String()
+}
+
+func renderNATTypesLocked() string {
 	var b strings.Builder
 	for cip, ports := range natSeen {
 		sym := false
@@ -145,7 +217,7 @@ func classifyNAT(ip string, dstPort, srcPort int) {
 		}
 		b.WriteString(cip + " " + kind + "\n")
 	}
-	_ = os.WriteFile(nncsTypeFile, []byte(b.String()), 0644)
+	return b.String()
 }
 
 func serveNNCS(port int) {
@@ -424,15 +496,9 @@ func sameUDPAddr(a, b *net.UDPAddr) bool {
 
 func zncHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("[ZNC] %s %s from %s\n", r.Method, r.URL.Path, r.RemoteAddr)
-	for k, vs := range r.Header {
-		for _, v := range vs {
-			fmt.Printf("[ZNC]   %s: %s\n", k, v)
-		}
-	}
-	body, _ := io.ReadAll(r.Body)
-	if len(body) > 0 {
-		fmt.Printf("[ZNC]   body: %s\n", string(body))
-	}
+	// Bound and drain the body on this public :443 handler; do NOT log full
+	// headers/body (they can carry tokens — the request line is enough).
+	_, _ = io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, 64<<10))
 	_ = r.Body.Close()
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
@@ -453,6 +519,18 @@ func main() {
 		fmt.Println("[LM3] Refusing to listen with a bogus key (PRUDP would only confuse captures).")
 		os.Exit(1)
 	}
+
+	// Fail fast rather than fall back to the public default Kerberos password: a server
+	// silently running on "securepasswordplz1" would let anyone who knows that value forge
+	// tickets. Force a strong, per-deployment NEXTENDO_SECURE_PASSWORD (auth+secure share it).
+	if securePassword == "" {
+		fmt.Println("[LM3] FATAL: NEXTENDO_SECURE_PASSWORD is not set.")
+		fmt.Println("[LM3] Set it to a strong per-deployment secret and restart.")
+		os.Exit(1)
+	}
+
+	// Debounce NAT-observation disk writes off the UDP packet path.
+	go natFileFlusher()
 
 	// The natbridge (in nextendo-nex) reads the observations via the NNCS_NAT_FILE
 	// env var; without it the bridge falls back to the Linux path /data/nat_endpoints.txt
@@ -677,6 +755,7 @@ func main() {
 	secureEndpoint.StartReaper()
 	go startDashboard(secureEndpoint, mm)
 	go startPresenceReporter(secureEndpoint)
+	go startPresenceReaper()
 
 	go serveNNCS(nncsUDPPort1)
 	go serveNNCS(nncsUDPPort2)
@@ -715,10 +794,11 @@ func min(a, b int) int {
 	return b
 }
 
-func resolveUser(username string, _ []byte) (uint64, []byte, bool) {
+func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
 	sk := sha256.Sum256([]byte("nextendo-src:" + username))
 	sourceKey := sk[:]
 
+	// 1. Signed nx2 token presented directly as the username.
 	if pid, ok := nextendoPIDFromToken(username); ok {
 		if allow, reason := nextendoOnlineCheck(pid, "ryujinx"); !allow {
 			fmt.Printf("[Auth] pid=%d online refused (%s)\n", pid, reason)
@@ -727,12 +807,32 @@ func resolveUser(username string, _ []byte) (uint64, []byte, bool) {
 		return pid, sourceKey, true
 	}
 
+	// 2. Bare numeric PID. Emulator PIDs are SEQUENTIAL from 1800000000, so a bare PID
+	// carries no proof: a custom build could send another member's PID and play as them
+	// (and via the one-place-online gate, evict the real owner). We close that by reading
+	// the signed nx2 token the emulator (>= 1.7.1) rides in the id_token's "nnex" claim
+	// INSIDE the login extraData, and requiring it to prove EXACTLY the announced PID.
+	// The enforce only targets the emulator range; a real CFW Switch (NSA >= 1810000000)
+	// sends no nx2 and stays on resolveNSAtoPID, so legitimate consoles are never gated.
 	if n, err := strconv.ParseUint(username, 10, 64); err == nil && n >= 1800000000 {
-		if requireSignedToken() {
-			fmt.Printf("[Auth] pid=%d refused: bare PID disabled\n", n)
-			return 0, nil, false
+		provenPID, proven := uint64(0), false
+		if tok, ok := nex.NexTokenFromLoginExtraData(extraData); ok {
+			provenPID, proven = nextendoPIDFromToken(tok)
 		}
-		fmt.Printf("[Auth] pid=%d bare PID identity (see NEXTENDO_REQUIRE_SIGNED_TOKEN)\n", n)
+		if n < 1810000000 {
+			switch {
+			case proven && provenPID == n:
+				fmt.Printf("[Auth][bind] pid=%d OK: nx2 proves the PID\n", n)
+			case proven && provenPID != n:
+				fmt.Printf("[Auth][bind] pid=%d IMPERSONATION: nx2 proves %d, not %d\n", n, provenPID, n)
+			default:
+				fmt.Printf("[Auth][bind] pid=%d NO PROOF: no nx2 in extraData (build < 1.7.1?)\n", n)
+			}
+			if requireSignedToken() && !(proven && provenPID == n) {
+				fmt.Printf("[Auth] pid=%d refused: identity not proven (signed nx2 token required)\n", n)
+				return 0, nil, false
+			}
+		}
 		pid, kind := n, "ryujinx"
 		if n >= 1810000000 {
 			kind = "switch"
@@ -740,6 +840,7 @@ func resolveUser(username string, _ []byte) (uint64, []byte, bool) {
 			switch st {
 			case nsaOK:
 				pid = rp
+				fmt.Printf("[Auth] NSA %d -> account pid=%d\n", n, pid)
 			case nsaUnknown, nsaUnreachable:
 				fmt.Printf("[Auth] NSA %d refused (%v)\n", n, st)
 				return 0, nil, false
@@ -759,6 +860,15 @@ func resolveUser(username string, _ []byte) (uint64, []byte, bool) {
 	return anonymousPID(username), sourceKey, true
 }
 
+// revokedNexPayloads lists leaked nex_token payloads ("pid.username.expiry") that must be
+// rejected even though their HMAC is valid. The 1.6.5 Windows release was packaged from a
+// folder holding a live session (portable/nextendo_account.txt), so that exact token leaked
+// to every downloader. The denylist kills it everywhere without rotating the shared secret
+// (which would disconnect everyone). Keep in sync with nextendo-account and the sibling servers.
+var revokedNexPayloads = map[string]bool{
+	"1800000006.Kazuu.1787343209": true, // leaked in the 1.6.5-win release (Kazuu / PID 1800000006)
+}
+
 func nextendoPIDFromToken(s string) (uint64, bool) {
 	if len(nextendoSecret) == 0 || !strings.HasPrefix(s, "nx2.") {
 		return 0, false
@@ -775,6 +885,9 @@ func nextendoPIDFromToken(s string) (uint64, bool) {
 	mac.Write([]byte("nex:" + string(raw)))
 	want := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	if !hmac.Equal([]byte(want), []byte(parts[1])) {
+		return 0, false
+	}
+	if revokedNexPayloads[string(raw)] { // leaked token (1.6.5-win) — rejected despite a valid signature
 		return 0, false
 	}
 	f := strings.SplitN(string(raw), ".", 3)
@@ -1022,7 +1135,7 @@ func encodeStationRecords(recs []stationRecord, code uint32) []byte {
 		for i := 0; i < 8; i++ {
 			body = append(body, byte(stationID>>(8*i)))
 		}
-		put32(&body, 2) // map entries
+		put32(&body, 2)        // map entries
 		body = append(body, 1) // key 1: station id (4 bytes LE)
 		put16(&body, 4)
 		for i := 0; i < 4; i++ {
