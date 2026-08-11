@@ -1,0 +1,7 @@
+/luigis-mansion-3
+*.exe
+*.linux
+*.bin
+cert.pem
+key.pem
+nextendo_secret.key
