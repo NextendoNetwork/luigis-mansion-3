@@ -5,4 +5,4 @@ See `example.env` for configuration. Not affiliated with Nintendo.
 
 ## Credits
 
-Luigi's Mansion 3 server implementation by [**@LITTLECHOPT8**](https://github.com/LITTLECHOPT8), who also maintains the [Citron Neo](https://github.com/CollectingW/emulator) client fork with Nextendo Network support.
+Luigi's Mansion 3 server implementation by [**@LITTLECHOPT8**](https://github.com/LITTLECHOPT8).
