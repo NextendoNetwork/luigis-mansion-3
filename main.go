@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	nex "github.com/NextendoNetwork/nextendo-nex"
 )
@@ -700,27 +701,28 @@ func main() {
 		switch req.Method {
 		case 5:
 			return nex.NewRMCSuccess(c.Settings, 0x79, req.Method, req.CallID, nil)
-		case 13, 14:
-			// Pia 5.17 parses the 0x79 station-list response with an explicit
-			// little-endian parser (0x7100EC1F40/0x7100EC1440/0x7100EC15D0):
-			//   u32 LE count
-			//   per record: u8 state, u32 LE recordLen, u64 LE stationId,
-			//                u32 LE mapCount, {u8 key, u16 LE len, value}*N
-			// The stationId u64 packs a result code in its high 32 bits; the
-			// client (0x7100EBF9C0) only accepts records where
-			// (stationId >> 32)/1000 == 128 (keep station) or 111 (drop).
-			// The record map: key 1 = station id (4 bytes LE), key 2 = station URL.
-			// Only InitializeStation's response handler (method 14) is live on
-			// the client (method 13's is a no-op), but the format is shared.
-			resp := buildStationRecords(c.PID, mm, secureEndpoint)
-			fmt.Printf("[LM3 Station] %s: %d records resp=%x\n",
-				rmcName(0x79, req.Method), recordCount(resp), resp)
+		case 13:
+			// « Voici mon état ». Sur la capture, Nintendo répond VIDE : la
+			// méthode ne sert qu'à publier. Ce qu'on en fait, c'est le retenir
+			// puis prévenir les amis en ligne (notification 128000), sans quoi
+			// personne ne vient jamais demander la méthode 15.
+			if st, ok := parsePublishedState(req.Body); ok {
+				publishFriendState(c.PID, st, mm, secureEndpoint)
+			}
+			return nex.NewRMCSuccess(c.Settings, 0x79, req.Method, req.CallID, nil)
+		case 14:
+			// « Je me connecte, qui est là ? » — Nintendo répond avec les fiches
+			// des amis, au même format que la méthode 15 (capture, appel 17).
+			ids := onlineFriendsWithState(mm, secureEndpoint, c.PID)
+			resp := buildFriendRecords(mm, secureEndpoint, ids)
+			fmt.Printf("[LM3 Station] %s: %d ami(s) avec état -> %d fiche(s) resp=%x\n",
+				rmcName(0x79, req.Method), len(ids), recordCount(resp), resp)
 			return nex.NewRMCSuccess(c.Settings, 0x79, req.Method, req.CallID, resp)
 		case 15:
-			// GetStationLocation request: u32 count + u64 stationId * count
-			// (+ trailing blob the client does not use). Answer per id:
-			// known stations get code 128000 records, unknown get 111000 so
-			// the client drops them from its station set.
+			// « Où sont mes amis ? » — requête : u32 count + u64 pid * count
+			// (+ un bloc de queue que le client n'utilise pas). On répond au
+			// format relevé sur le serveur de Nintendo : par ami, son PID tel
+			// quel, l'identifiant de son salon et son pseudo (cf. friendRecord).
 			var ids []uint64
 			if len(req.Body) >= 4 {
 				in := nex.NewStreamIn(req.Body, c.Settings)
@@ -729,9 +731,9 @@ func main() {
 					ids = append(ids, in.U64())
 				}
 			}
-			resp := buildStationRecordsFor(c.PID, mm, secureEndpoint, ids)
-			fmt.Printf("[LM3 Station] %s: asked=%d ids=%v resp=%x\n",
-				rmcName(0x79, req.Method), len(ids), ids, resp)
+			resp := buildFriendRecords(mm, secureEndpoint, ids)
+			fmt.Printf("[LM3 Station] %s: demandés=%d ids=%v -> %d ami(s) en salon resp=%x\n",
+				rmcName(0x79, req.Method), len(ids), ids, recordCount(resp), resp)
 			return nex.NewRMCSuccess(c.Settings, 0x79, req.Method, req.CallID, resp)
 		default:
 			return nex.NewRMCSuccess(c.Settings, 0x79, req.Method, req.CallID, nil)
@@ -749,6 +751,9 @@ func main() {
 	}
 	secureEndpoint.OnDisconnect = func(c *nex.Connection) {
 		mm.RemovePlayer(c.PID)
+		// Sans ça, un joueur parti continuerait d'apparaître aux autres avec
+		// le dernier salon qu'il avait ouvert.
+		forgetFriendState(c.PID)
 	}
 	secureServer := nex.NewServer(secureEndpoint)
 
@@ -1017,6 +1022,121 @@ func stationURLOfPID(ep *nex.Endpoint, pid uint64) string {
 type stationRecord struct {
 	stationID uint64 // client-side "station id" = server connection ID (RVCID), NOT PID
 	url       string
+}
+
+// ---------------------------------------------------------------------------
+// 0x79 method 15 — "où est mon ami ?"
+//
+// Format RELEVÉ SUR LE SERVEUR DE NINTENDO (capture du 2026-08-12, deux consoles
+// amies en ligne). Le client envoie la liste des PID de ses amis et le serveur
+// répond, pour chacun, l'identifiant du salon où il se trouve et son pseudo —
+// c'est ce qui alimente l'écran « entre amis ».
+//
+// Réponse observée (little-endian), pour un ami :
+//
+//	u32 count = 1
+//	u8  state = 0
+//	u32 recordLen = 71
+//	u64 pid                        <- le PID demandé, RENVOYÉ TEL QUEL
+//	u32 mapCount = 3
+//	u8 0, u16 2,  <2 octets>       <- drapeaux d'état (0x7440 observé en salon)
+//	u8 1, u16 4,  <gid>            <- l'identifiant du salon de l'ami
+//	u8 2, u16 44, <pseudo UTF-8>   <- "invite65★☆", complété de zéros
+//
+// Deux écarts avec l'implémentation précédente, qui empêchaient le client de
+// reconnaître ses amis : le PID était remplacé par (code << 32) | RVCID, et la
+// clé 2 portait une URL de station au lieu du pseudo.
+const friendNameFieldLen = 44 // le champ pseudo est de taille fixe
+
+type friendRecord struct {
+	pid   uint64
+	flags uint16
+	gid   uint32
+	name  string
+}
+
+// encodeFriendRecords sérialise la réponse de la méthode 15 telle que Nintendo la produit.
+func encodeFriendRecords(recs []friendRecord) []byte {
+	put16 := func(b *[]byte, v uint16) { *b = append(*b, byte(v), byte(v>>8)) }
+	put32 := func(b *[]byte, v uint32) {
+		*b = append(*b, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+	}
+
+	var body []byte
+	put32(&body, uint32(len(recs)))
+	for _, r := range recs {
+		// Pseudo sur un champ de taille fixe : tronqué sur une frontière de rune
+		// (couper au milieu d'un caractère multi-octets donnerait de l'UTF-8 invalide),
+		// puis complété de zéros.
+		name := make([]byte, friendNameFieldLen)
+		raw := []byte(r.name)
+		if len(raw) > friendNameFieldLen {
+			raw = raw[:friendNameFieldLen]
+			for len(raw) > 0 && !utf8.Valid(raw) {
+				raw = raw[:len(raw)-1]
+			}
+		}
+		copy(name, raw)
+
+		recLen := 8 + 4 + (1 + 2 + 2) + (1 + 2 + 4) + (1 + 2 + friendNameFieldLen)
+		body = append(body, 0) // state
+		put32(&body, uint32(recLen))
+		for i := 0; i < 8; i++ { // le PID demandé, tel quel
+			body = append(body, byte(r.pid>>(8*i)))
+		}
+		put32(&body, 3) // trois entrées dans la map
+
+		body = append(body, 0) // clé 0 : drapeaux d'état
+		put16(&body, 2)
+		put16(&body, r.flags)
+
+		body = append(body, 1) // clé 1 : le salon de l'ami
+		put16(&body, 4)
+		put32(&body, r.gid)
+
+		body = append(body, 2) // clé 2 : son pseudo
+		put16(&body, friendNameFieldLen)
+		body = append(body, name...)
+	}
+	return body
+}
+
+// buildFriendRecords répond aux méthodes 14 et 15 : pour chaque PID demandé, on
+// REDIFFUSE l'état que cet ami a lui-même publié (méthode 13). C'est exactement
+// ce que fait le serveur de Nintendo — la capture montre que les valeurs servies
+// à un joueur sont celles que son ami avait publiées juste avant. Un ami qui n'a
+// rien publié (hors ligne, ou pas encore arrivé sur l'écran en ligne) est
+// simplement absent de la réponse.
+func buildFriendRecords(mm *nex.Matchmaking, ep *nex.Endpoint, pids []uint64) []byte {
+	recs := make([]friendRecord, 0, len(pids))
+	for _, pid := range pids {
+		target := pid
+		// Le client renvoie parfois le RVCID plutôt que le PID : on retombe sur
+		// la connexion pour retrouver le vrai PID.
+		if ep.FindConnectionByPID(pid) == nil {
+			if c := ep.FindConnectionByID(uint32(pid)); c != nil {
+				target = c.PID
+			}
+		}
+		st, ok := getFriendState(target)
+		if !ok {
+			continue
+		}
+		name := st.name
+		if name == "" {
+			name = friendDisplayName(target)
+		}
+		// Le salon publié fait foi ; s'il est absent (client qui ne le renseigne
+		// pas), on retombe sur celui que notre matchmaking connaît.
+		gid := st.gid
+		if gid == 0 {
+			if g, inRoom := mm.GatheringIDByPID(target); inRoom {
+				gid = g
+			}
+		}
+		recs = append(recs, friendRecord{pid: pid, flags: st.flags, gid: gid, name: name})
+	}
+	return encodeFriendRecords(recs)
 }
 
 // buildStationRecords builds the little-endian 0x79 station-record response the

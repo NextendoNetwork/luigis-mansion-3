@@ -383,3 +383,71 @@ func startPresenceReporter(endpoint *nex.Endpoint) {
 		resp.Body.Close()
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Pseudos réels.
+//
+// L'écran « entre amis » affiche le nom du joueur tel que le serveur le renvoie
+// (relevé chez Nintendo : "invite65★☆"). Le nom de repli "Joueur-12345" ferait
+// donc afficher un identifiant à la place du pseudo. On le résout auprès du
+// service de comptes, avec un cache : la méthode 15 est appelée en boucle par le
+// jeu, on ne peut pas faire un appel HTTP à chaque fois.
+var (
+	nameMu    sync.Mutex
+	nameCache = map[uint64]nameEntry{}
+)
+
+type nameEntry struct {
+	name string
+	at   time.Time
+}
+
+const nameCacheTTL = 5 * time.Minute
+
+// realName renvoie le pseudo du joueur, ou "" si le service ne le connaît pas
+// (l'appelant retombe alors sur son nom générique).
+func realName(pid uint64) string {
+	nameMu.Lock()
+	if e, ok := nameCache[pid]; ok && time.Since(e.at) < nameCacheTTL {
+		nameMu.Unlock()
+		return e.name
+	}
+	nameMu.Unlock()
+
+	name := ""
+	if accountBaseURL != "" {
+		req, err := http.NewRequest("GET",
+			accountBaseURL+"/api/names?pids="+strconv.FormatUint(pid, 10), nil)
+		if err == nil {
+			if internalKey != "" {
+				req.Header.Set("X-Internal-Key", internalKey)
+			}
+			if resp, err := gateClient.Do(req); err == nil {
+				defer resp.Body.Close()
+				var out struct {
+					Names map[string]struct {
+						Name string `json:"name"`
+					} `json:"names"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&out) == nil {
+					if v, ok := out.Names[strconv.FormatUint(pid, 10)]; ok {
+						name = v.Name
+					}
+				}
+			}
+		}
+	}
+
+	nameMu.Lock()
+	nameCache[pid] = nameEntry{name: name, at: time.Now()} // on mémorise aussi l'échec, pour ne pas marteler
+	nameMu.Unlock()
+	return name
+}
+
+// friendDisplayName : le vrai pseudo si on l'a, sinon le nom générique.
+func friendDisplayName(pid uint64) string {
+	if n := realName(pid); n != "" {
+		return n
+	}
+	return dispName(pid)
+}
