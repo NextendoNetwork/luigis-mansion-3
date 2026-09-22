@@ -1,6 +1,6 @@
 # luigis-mansion-3
 
-NEX game server for **Luigi's Mansion 3**, built on the NextendoNetwork [nextendo-nex](https://github.com/NextendoNetwork/nextendo-nex) core. Source only — no binaries, no certs. Not affiliated with Nintendo.
+NEX game server for **Luigi's Mansion 3**, built on the NextendoNetwork [nextendo-nex](https://github.com/NextendoNetwork/nextendo-nex) core. Source only, no binaries, no certs. Not affiliated with Nintendo.
 
 ## Build
 
